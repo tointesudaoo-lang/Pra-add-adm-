@@ -1,0 +1,269 @@
+name: Windows RDP - Performance Optimized
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remote-windows:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Optimize Windows Performance
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Otimizando o Windows..."
+
+          # Plano de energia de alto desempenho, se disponível
+          $plans = powercfg /list
+          $high = $plans | Select-String "High performance"
+
+          if ($high) {
+            $guid = [regex]::Match(
+              $high.Line,
+              '[a-fA-F0-9-]{36}'
+            ).Value
+
+            if ($guid) {
+              powercfg /setactive $guid
+            }
+          }
+
+          # Desativa hibernação
+          powercfg /hibernate off
+
+          # Reduz efeitos visuais nas sessões RDP
+          $rdpPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          New-Item -Path $rdpPath -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $rdpPath `
+            -Name "fDisableWallpaper" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $rdpPath `
+            -Name "fDisableFullWindowDrag" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $rdpPath `
+            -Name "fDisableMenuAnims" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          New-ItemProperty `
+            -Path $rdpPath `
+            -Name "fDisableTheming" `
+            -PropertyType DWord `
+            -Value 1 `
+            -Force | Out-Null
+
+          # Ativa o Game Mode no perfil do runner
+          $gamePath = "HKCU:\Software\Microsoft\GameBar"
+
+          New-Item -Path $gamePath -Force | Out-Null
+
+          Set-ItemProperty `
+            -Path $gamePath `
+            -Name "AutoGameModeEnabled" `
+            -Type DWord `
+            -Value 1
+
+          # Verifica memória e processador disponíveis
+          Write-Host "Processadores: $env:NUMBER_OF_PROCESSORS"
+
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object `
+              @{N="RAM Total (GB)";E={[math]::Round($_.TotalVisibleMemorySize / 1MB, 2)}},
+              @{N="RAM Livre (GB)";E={[math]::Round($_.FreePhysicalMemory / 1MB, 2)}} |
+            Format-List
+
+          Write-Host "Otimizacao concluida."
+
+      - name: Configure RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Write-Host "RDP configurado."
+
+      - name: Create RDP Account
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $Username = "RemoteUser"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Configure o secret RDP_PASSWORD antes de executar."
+          }
+
+          $SecurePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $oldUser = Get-LocalUser `
+            -Name $Username `
+            -ErrorAction SilentlyContinue
+
+          if ($oldUser) {
+            Set-LocalUser `
+              -Name $Username `
+              -Password $SecurePassword
+          } else {
+            New-LocalUser `
+              -Name $Username `
+              -Password $SecurePassword `
+              -Description "Remote Desktop User" `
+              -PasswordNeverExpires
+          }
+
+          Enable-LocalUser -Name $Username
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $Username `
+            -ErrorAction SilentlyContinue
+
+          # Não concede privilégios de administrador desnecessários.
+          Write-Host "Conta RDP pronta: .\$Username"
+
+      - name: Verify RDP Account
+        shell: powershell
+        run: |
+          $user = Get-LocalUser -Name "RemoteUser"
+
+          if (!$user -or !$user.Enabled) {
+            throw "A conta RDP não está habilitada."
+          }
+
+          Write-Host "Conta habilitada: $($user.Name)"
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $Installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $Installer
+
+          try {
+            $process = Start-Process `
+              -FilePath "msiexec.exe" `
+              -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+              -Wait `
+              -PassThru
+
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Instalacao do Tailscale falhou: $($process.ExitCode)"
+            }
+          } finally {
+            Remove-Item $Installer -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Configure o secret TAILSCALE_AUTH_KEY."
+          }
+
+          $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (!(Test-Path $Tailscale)) {
+            throw "Tailscale nao encontrado."
+          }
+
+          & $Tailscale up `
+            --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="github-rdp-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao conectar o Tailscale."
+          }
+
+          $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if (!$IP) {
+            throw "IP Tailscale nao encontrado."
+          }
+
+          "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
+
+          Write-Host "IP Tailscale: $IP"
+
+      - name: Verify RDP Service
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Start-Sleep -Seconds 5
+
+          $service = Get-Service TermService
+
+          if ($service.Status -ne "Running") {
+            throw "O servico RDP nao esta ativo."
+          }
+
+          $listener = Get-NetTCPConnection `
+            -State Listen `
+            -LocalPort 3389 `
+            -ErrorAction SilentlyContinue
+
+          if (!$listener) {
+            throw "Nenhum processo esta escutando na porta 3389."
+          }
+
+          Write-Host "Servico RDP ativo."
+          Write-Host "Porta TCP 3389 em escuta."
+
+      - name: Connection Information
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "=================================="
+          Write-Host "        WINDOWS RDP PRONTO"
+          Write-Host "=================================="
+          Write-Host "Endereco: $env:TAILSCALE_IP"
+          Write-Host "Porta: 3389"
+          Write-Host "Usuario: .\RemoteUser"
+          Write-Host "Senha: valor configurado no secret RDP_PASSWORD"
+          Write-Host "=================================="
+
+      - name: Keep RDP Online
+        shell: powershell
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Windows ativo."
+            Start-Sleep -Seconds 60
+          }
